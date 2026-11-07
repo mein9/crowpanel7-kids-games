@@ -5,6 +5,8 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <Preferences.h>
+#include <driver/i2s.h>
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
 #include <lgfx/v1/platforms/esp32s3/Panel_RGB.hpp>
@@ -104,6 +106,7 @@ static LGFX tft;
 // or briefly an off-screen sprite so moving pieces can be drawn without blinking.
 static lgfx::LovyanGFX *gfx = &tft;
 static LGFX_Sprite mazePatch(&tft);
+static Preferences prefs;  // settings kept in flash (sound on/off)
 
 // ---------------------------------------------------------------- colors
 static uint16_t C_BG, C_BAR, C_FLOOR, C_WALL, C_FACE, C_FACE_EDGE, C_DARK, C_STAR, C_STAR_EDGE;
@@ -126,6 +129,126 @@ static void initColors() {
   RAINBOW[4] = tft.color565(60, 160, 255);
   RAINBOW[5] = tft.color565(140, 90, 230);
   RAINBOW[6] = tft.color565(230, 90, 200);
+}
+
+// ---------------------------------------------------------------- sound
+// Speaker connector on the basic CrowPanel 7.0: NS4168 I2S amplifier.
+// Sounds are synthesized on the fly (no audio files) by a background task,
+// so games never wait for a sound to finish. Harmless with no speaker plugged in.
+#define I2S_BCLK 42
+#define I2S_LRC  18
+#define I2S_DOUT 17
+static const int SAMPLE_RATE = 22050;
+
+enum Snd : uint8_t { SND_STEP, SND_WIN, SND_POP, SND_FLIP, SND_MATCH, SND_NOPE,
+                     SND_TAP, SND_COLOR, SND_CLEAR, SND_START };
+struct Tone { uint16_t f0, f1, ms; uint8_t vol; };  // glide f0 -> f1, f0 = 0 is a rest
+struct SoundReq { uint8_t id; uint8_t pitch; };     // pitch in percent (100 = as written)
+
+static const Tone T_STEP[]  = {{660, 660, 70, 35}};
+static const Tone T_WIN[]   = {{523, 523, 110, 70}, {659, 659, 110, 70}, {784, 784, 110, 70},
+                               {1047, 1047, 160, 75}, {0, 0, 60, 0}, {784, 784, 90, 60}, {1047, 1047, 320, 80}};
+static const Tone T_POP[]   = {{900, 280, 70, 70}};
+static const Tone T_FLIP[]  = {{1100, 1500, 45, 40}};
+static const Tone T_MATCH[] = {{784, 784, 100, 65}, {1047, 1047, 200, 70}};
+static const Tone T_NOPE[]  = {{440, 440, 120, 45}, {370, 370, 180, 45}};
+static const Tone T_TAP[]   = {{880, 880, 50, 45}};
+static const Tone T_COLOR[] = {{1000, 1200, 50, 40}};
+static const Tone T_CLEAR[] = {{300, 1300, 220, 45}};
+static const Tone T_START[] = {{523, 523, 90, 55}, {784, 784, 160, 60}};
+
+struct Melody { const Tone *tones; uint8_t count; bool interruptible; };
+static const Melody MELODIES[] = {
+  {T_STEP, 1, true}, {T_WIN, 7, false}, {T_POP, 1, true}, {T_FLIP, 1, true},
+  {T_MATCH, 2, false}, {T_NOPE, 2, true}, {T_TAP, 1, true}, {T_COLOR, 1, true},
+  {T_CLEAR, 1, true}, {T_START, 2, false},
+};
+
+static QueueHandle_t soundQ = nullptr;
+static bool muted = false;
+static const int MASTER_VOLUME = 9000;  // peak sample value at vol 100 (of 32767): kid-friendly
+
+static void playSound(Snd id, uint8_t pitch = 100) {
+  if (muted || !soundQ) return;
+  SoundReq r = {id, pitch};
+  xQueueSend(soundQ, &r, 0);  // drop it if the queue is full rather than wait
+}
+
+static void audioTask(void *) {
+  static int16_t buf[256 * 2];  // stereo frames
+  float phase = 0;
+  SoundReq req;
+  for (;;) {
+    if (xQueueReceive(soundQ, &req, portMAX_DELAY) != pdTRUE) continue;
+    const Melody &m = MELODIES[req.id];
+    bool abort = false;
+    for (int t = 0; t < m.count && !abort; t++) {
+      const Tone &tn = m.tones[t];
+      int total = SAMPLE_RATE * tn.ms / 1000;
+      int attack = SAMPLE_RATE * 5 / 1000;
+      float f0 = tn.f0 * req.pitch / 100.0f, f1 = tn.f1 * req.pitch / 100.0f;
+      for (int i = 0; i < total && !abort;) {
+        int n = min(256, total - i);
+        for (int k = 0; k < n; k++, i++) {
+          float s = 0;
+          if (tn.f0) {
+            float pos = (float)i / total;
+            float f = f0 + (f1 - f0) * pos;
+            phase += 2 * PI * f / SAMPLE_RATE;
+            if (phase > 2 * PI) phase -= 2 * PI;
+            // soft attack, bell-like fade out
+            float env = i < attack ? (float)i / attack : (1 - pos) * (1 - pos) * 0.6f + (1 - pos) * 0.4f;
+            s = (sinf(phase) + 0.2f * sinf(2 * phase)) * env * tn.vol / 100.0f;
+          }
+          int16_t v = (int16_t)(s * MASTER_VOLUME);
+          buf[2 * k] = v;
+          buf[2 * k + 1] = v;
+        }
+        size_t written;
+        i2s_write(I2S_NUM_0, buf, n * 4, &written, portMAX_DELAY);
+        // a new sound cuts short a quick one (e.g. fast maze steps), never the win tune
+        if (m.interruptible && uxQueueMessagesWaiting(soundQ) > 0) abort = true;
+      }
+    }
+    i2s_zero_dma_buffer(I2S_NUM_0);
+  }
+}
+
+static void initSound() {
+  prefs.begin("kidgames", false);
+  muted = prefs.getBool("muted", false);
+
+  i2s_config_t cfg = {};
+  cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+  cfg.sample_rate = SAMPLE_RATE;
+  cfg.bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT;
+  cfg.channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT;
+  cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+  cfg.dma_buf_count = 6;
+  cfg.dma_buf_len = 256;
+  cfg.tx_desc_auto_clear = true;  // silence, not a buzz, when nothing is playing
+  if (i2s_driver_install(I2S_NUM_0, &cfg, 0, nullptr) != ESP_OK) {
+    Serial.println("Sound: I2S init failed");
+    return;
+  }
+  i2s_pin_config_t pins = {};
+  pins.mck_io_num = I2S_PIN_NO_CHANGE;
+  pins.bck_io_num = I2S_BCLK;
+  pins.ws_io_num = I2S_LRC;
+  pins.data_out_num = I2S_DOUT;
+  pins.data_in_num = I2S_PIN_NO_CHANGE;
+  i2s_set_pin(I2S_NUM_0, &pins);
+  i2s_zero_dma_buffer(I2S_NUM_0);
+
+  soundQ = xQueueCreate(6, sizeof(SoundReq));
+  xTaskCreatePinnedToCore(audioTask, "audio", 4096, nullptr, 2, nullptr, 0);
+  Serial.printf("Sound ready (%s)\n", muted ? "muted" : "on");
+}
+
+static void setMuted(bool m) {
+  muted = m;
+  prefs.putBool("muted", m);  // remembered across power cycles
+  if (m && soundQ) xQueueReset(soundQ);
 }
 
 // ---------------------------------------------------------------- maze
@@ -597,6 +720,26 @@ static const int TILE_W = 370, TILE_H = 196;
 static int tileX(int i) { return 20 + (i % 2) * 390; }
 static int tileY(int i) { return 62 + (i / 2) * 208; }
 
+// speaker icon, top right of the home screen: tap to turn sound on/off
+static const int SOUND_BX = SCREEN_W - 40, SOUND_BY = 32;
+static void drawSoundButton() {
+  int bx = SOUND_BX, by = SOUND_BY;
+  tft.fillCircle(bx, by, 24, TFT_WHITE);
+  tft.fillRect(bx - 14, by - 6, 8, 12, C_WALL);                                // speaker body
+  tft.fillTriangle(bx - 7, by - 6, bx - 7, by + 6, bx + 3, by - 13, C_WALL);   // cone
+  tft.fillTriangle(bx - 7, by + 6, bx + 3, by + 13, bx + 3, by - 13, C_WALL);
+  if (muted) {
+    uint16_t red = tft.color565(230, 60, 60);
+    tft.drawWideLine(bx + 7, by - 7, bx + 17, by + 7, 2.5f, red);
+    tft.drawWideLine(bx + 7, by + 7, bx + 17, by - 7, 2.5f, red);
+  } else {
+    tft.fillArc(bx + 1, by, 11, 8, 315, 360, C_WALL);  // sound waves
+    tft.fillArc(bx + 1, by, 11, 8, 0, 45, C_WALL);
+    tft.fillArc(bx + 1, by, 18, 15, 315, 360, C_WALL);
+    tft.fillArc(bx + 1, by, 18, 15, 0, 45, C_WALL);
+  }
+}
+
 static void drawHome() {
   static const char* labels[4] = {"Maze", "Draw", "Bubbles", "Memory"};
   uint16_t fills[4] = {tft.color565(215, 195, 255), tft.color565(255, 222, 175),
@@ -607,6 +750,7 @@ static void drawHome() {
   tft.setFont(&fonts::FreeSansBold24pt7b);
   tft.setTextColor(C_WALL);
   tft.drawString("Let's Play!", SCREEN_W / 2, 32);
+  drawSoundButton();
   for (int i = 0; i < 4; i++) {
     int x = tileX(i), y = tileY(i);
     tft.fillRoundRect(x, y, TILE_W, TILE_H, 28, C_WALL);
@@ -668,9 +812,19 @@ static void enterApp(App a) {
 
 static void homeTick(bool pressed, int32_t tx, int32_t ty) {
   if (!pressed) return;
+  int sx = tx - SOUND_BX, sy = ty - SOUND_BY;
+  if (sx * sx + sy * sy < 34 * 34) {
+    setMuted(!muted);
+    tft.startWrite();
+    drawSoundButton();
+    tft.endWrite();
+    playSound(SND_TAP);  // only heard when sound was just turned on
+    return;
+  }
   for (int i = 0; i < 4; i++) {
     if (tx >= tileX(i) && tx < tileX(i) + TILE_W && ty >= tileY(i) && ty < tileY(i) + TILE_H) {
       static const App apps[4] = {APP_MAZE, APP_DRAW, APP_BUBBLES, APP_MEMORY};
+      playSound(SND_TAP);
       enterApp(apps[i]);
       return;
     }
@@ -687,8 +841,8 @@ static void startMaze() {
 }
 
 static void mazeTick(bool touching, bool pressed, int32_t tx, int32_t ty) {
-  if (homePressed(pressed, tx, ty)) { enterApp(APP_HOME); return; }
-  if (newPressed(pressed, tx, ty)) { startMaze(); return; }
+  if (homePressed(pressed, tx, ty)) { playSound(SND_TAP); enterApp(APP_HOME); return; }
+  if (newPressed(pressed, tx, ty)) { playSound(SND_TAP); startMaze(); return; }
   if (!touching || ty < oy || tx < ox || millis() - lastStep < 70) return;
   int cx = (tx - ox) / cell;
   int cy = (ty - oy) / cell;
@@ -696,9 +850,13 @@ static void mazeTick(bool touching, bool pressed, int32_t tx, int32_t ty) {
   // forgiving: follow the finger if it's within 2 steps along the path
   int d = firstStepToward(cx, cy, 2);
   if (d < 0) return;
+  // each step plays the next note of a little pentatonic tune
+  static const uint8_t STEP_PITCH[5] = {100, 112, 126, 150, 168};
+  playSound(SND_STEP, STEP_PITCH[steps % 5]);
   movePlayer(d);
   lastStep = millis();
   if (px == gx && py == gy) {
+    playSound(SND_WIN);
     celebrate();
     if (level < NUM_LEVELS - 1) level++;
     startMaze();
@@ -742,15 +900,16 @@ static void startDraw() {
 }
 
 static void drawTick(bool touching, bool pressed, int32_t tx, int32_t ty) {
-  if (homePressed(pressed, tx, ty)) { enterApp(APP_HOME); return; }
+  if (homePressed(pressed, tx, ty)) { playSound(SND_TAP); enterApp(APP_HOME); return; }
   if (newPressed(pressed, tx, ty)) {
+    playSound(SND_CLEAR);
     tft.fillRect(0, BAR, SCREEN_W, SCREEN_H - BAR, TFT_WHITE);
     return;
   }
   if (pressed && ty < BAR) {
     for (int i = 0; i < NSW; i++) {
       int dx = tx - swatchX(i), dy = ty - BAR / 2;
-      if (dx * dx + dy * dy < 31 * 31) { drawCol = i; drawDrawBar(); break; }
+      if (dx * dx + dy * dy < 31 * 31) { drawCol = i; playSound(SND_COLOR); drawDrawBar(); break; }
     }
     stroking = false;
     return;
@@ -824,12 +983,15 @@ static void startBubbles() {
 }
 
 static void bubblesTick(bool touching, bool pressed, int32_t tx, int32_t ty) {
-  if (homePressed(pressed, tx, ty)) { enterApp(APP_HOME); return; }
+  if (homePressed(pressed, tx, ty)) { playSound(SND_TAP); enterApp(APP_HOME); return; }
   if (touching && ty > BAR) {
     for (int i = 0; i < NB; i++) {
       Bubble &b = bubbles[i];
       float dx = tx - b.x, dy = ty - b.y;
-      if (b.popT == 0 && dx * dx + dy * dy < (b.r + 12) * (b.r + 12)) b.popT = 1;
+      if (b.popT == 0 && dx * dx + dy * dy < (b.r + 12) * (b.r + 12)) {
+        b.popT = 1;
+        playSound(SND_POP, 190 - b.r * 1.5f);  // big bubbles pop lower
+      }
     }
   }
   if (millis() - lastFrame < 33) return;
@@ -936,9 +1098,10 @@ static void startMemory() {
 }
 
 static void memoryTick(bool touching, bool pressed, int32_t tx, int32_t ty) {
-  if (homePressed(pressed, tx, ty)) { enterApp(APP_HOME); return; }
+  if (homePressed(pressed, tx, ty)) { playSound(SND_TAP); enterApp(APP_HOME); return; }
   if (memFlipBack && millis() >= memFlipBack) {  // not a match: turn both back over
     memState[memFirst] = memState[memSecond] = 0;
+    playSound(SND_NOPE);
     drawCard(memFirst);
     drawCard(memSecond);
     memFirst = memSecond = -1;
@@ -949,11 +1112,13 @@ static void memoryTick(bool touching, bool pressed, int32_t tx, int32_t ty) {
     int x = cardX(i), y = cardY(i);
     if (tx < x || tx >= x + cardW || ty < y || ty >= y + cardH || memState[i] != 0) continue;
     memState[i] = 1;
+    playSound(SND_FLIP);
     drawCard(i);
     if (memFirst < 0) { memFirst = i; return; }
     memSecond = i;
     if (memSym[memFirst] == memSym[memSecond]) {
       memState[memFirst] = memState[memSecond] = 2;
+      playSound(SND_MATCH);
       drawCard(memFirst);
       drawCard(memSecond);
       memFirst = memSecond = -1;
@@ -961,6 +1126,7 @@ static void memoryTick(bool touching, bool pressed, int32_t tx, int32_t ty) {
       for (int k = 0; k < memN; k++) if (memState[k] != 2) done = false;
       if (done) {
         delay(500);
+        playSound(SND_WIN);
         confetti(120);
         tft.startWrite();
         tft.fillCircle(SCREEN_W / 2, (SCREEN_H + BAR) / 2, 140, TFT_WHITE);
@@ -996,8 +1162,10 @@ void setup() {
   initColors();
   digitalWrite(PIN_BL, HIGH);
   Serial.println("Display up");
+  initSound();
 
   drawHome();
+  playSound(SND_START);
 }
 
 void loop() {

@@ -19,6 +19,19 @@ A home screen with four big tiles. A house button (top left) in each game goes b
 - **Memory**: flip two cards to find a match (star, cat, car, dino, heart, ball).
   Switches between 3 and 4 pairs.
 
+## Sound
+
+Plug a small speaker (4–8 Ω, around 1–3 W) into the board's **SPK** connector.
+Sounds are generated in code (no audio files): a startup chime, a little tune as
+the maze character steps, a happy jingle for every win, bubble pops (big bubbles
+pop lower), card flips, a match chime, and taps on buttons.
+
+The **speaker button** at the top right of the home screen turns sound on and off.
+The setting is remembered after the board is unplugged. Without a speaker
+everything works the same, just silently.
+
+Speaker connector: NS4168 I2S amplifier on GPIO 17 (data), 18 (LRCLK) and 42 (BCLK).
+
 ## Hardware
 
 This is for the **basic CrowPanel 7.0**, not the CrowPanel **ADVANCE** 7.0.
