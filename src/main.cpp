@@ -6,6 +6,11 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <Preferences.h>
+#include <LittleFS.h>
+#include <SD.h>
+#include <SPI.h>
+#include <vector>
+#include <algorithm>
 #include <driver/i2s.h>
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
@@ -106,6 +111,21 @@ static LGFX tft;
 // or briefly an off-screen sprite so moving pieces can be drawn without blinking.
 static lgfx::LovyanGFX *gfx = &tft;
 static LGFX_Sprite mazePatch(&tft);
+// Whole-screen off-screen copy (PSRAM) for the Draw app and its gallery: screens
+// are drawn here first, then shown in one go, so nothing visibly redraws.
+static LGFX_Sprite screenSpr(&tft);
+
+// start drawing off-screen (if there's memory for it; otherwise straight to the screen)
+static bool offscreenBegin() {
+  if (!screenSpr.getBuffer()) return false;
+  gfx = &screenSpr;
+  return true;
+}
+// show rows y0..y0+h of the off-screen copy, and go back to drawing on the screen
+static void offscreenShow(int y0, int h) {
+  gfx = &tft;
+  tft.pushImage(0, y0, SCREEN_W, h, (lgfx::swap565_t *)screenSpr.getBuffer() + y0 * SCREEN_W);
+}
 static Preferences prefs;  // settings kept in flash (sound on/off)
 
 // ---------------------------------------------------------------- colors
@@ -488,26 +508,26 @@ static int pieceRadius() { return (cell - wallT) / 2 - 6; }
 // house icon, top left: back to the home screen
 static void drawHomeButton() {
   int bx = 40, by = (TOP - 8) / 2;
-  tft.fillCircle(bx, by, 24, TFT_WHITE);
-  tft.fillTriangle(bx - 17, by - 1, bx + 17, by - 1, bx, by - 17, C_WALL);
-  tft.fillRect(bx - 11, by - 2, 22, 16, C_WALL);
-  tft.fillRect(bx - 4, by + 5, 8, 9, TFT_WHITE);
+  gfx->fillCircle(bx, by, 24, TFT_WHITE);
+  gfx->fillTriangle(bx - 17, by - 1, bx + 17, by - 1, bx, by - 17, C_WALL);
+  gfx->fillRect(bx - 11, by - 2, 22, 16, C_WALL);
+  gfx->fillRect(bx - 4, by + 5, 8, 9, TFT_WHITE);
 }
 
 // round-arrow icon, top right: start over
 static void drawNewButton() {
   int bx = SCREEN_W - 40, by = (TOP - 8) / 2;
-  tft.fillCircle(bx, by, 24, TFT_WHITE);
+  gfx->fillCircle(bx, by, 24, TFT_WHITE);
   // ring going clockwise from 3 o'clock round to the upper right, gap at the top right
   const float endDeg = 300;
-  tft.fillArc(bx, by, 16, 10, 0, endDeg, C_WALL);
+  gfx->fillArc(bx, by, 16, 10, 0, endDeg, C_WALL);
   // arrowhead sits on the end of the ring and points along it (clockwise)
   float a = endDeg * DEG_TO_RAD;
   float rm = 13;                         // middle of the ring
   float ex = bx + cosf(a) * rm, ey = by + sinf(a) * rm;
   float tx = -sinf(a), ty = cosf(a);     // direction of travel
   float nx = cosf(a), ny = sinf(a);      // outward from the center
-  tft.fillTriangle(ex + tx * 10, ey + ty * 10,
+  gfx->fillTriangle(ex + tx * 10, ey + ty * 10,
                    ex + nx * 9 - tx * 2, ey + ny * 9 - ty * 2,
                    ex - nx * 9 - tx * 2, ey - ny * 9 - ty * 2, C_WALL);
 }
@@ -696,7 +716,7 @@ static uint8_t findTouch() {
 }
 
 // ---------------------------------------------------------------- shared
-enum App { APP_HOME, APP_MAZE, APP_DRAW, APP_BUBBLES, APP_MEMORY };
+enum App { APP_HOME, APP_MAZE, APP_DRAW, APP_BUBBLES, APP_MEMORY, APP_GALLERY };
 static App app = APP_HOME;
 static const int BAR = TOP - 8;  // height of the top bar
 static bool ignoreUntilRelease = false;
@@ -750,7 +770,7 @@ static void drawSymbol(int s, int cx, int cy, int r) {
 }
 
 static void drawPlainBar() {
-  tft.fillRect(0, 0, SCREEN_W, BAR, C_BAR);
+  gfx->fillRect(0, 0, SCREEN_W, BAR, C_BAR);
   drawHomeButton();
 }
 
@@ -883,6 +903,7 @@ static void enterApp(App a) {
     case APP_DRAW: startDraw(); break;
     case APP_BUBBLES: startBubbles(); break;
     case APP_MEMORY: startMemory(); break;
+    case APP_GALLERY: break;  // opened from Draw
   }
 }
 
@@ -964,7 +985,8 @@ static void mazeTick(bool touching, bool pressed, int32_t tx, int32_t ty) {
 }
 
 // ---------------------------------------------------------------- draw app
-static const int NSW = 9;  // 7 rainbow, dark, eraser
+static const int NSW = 9;  // 7 rainbow, dark, eraser (white = the paper)
+static const int PAPER = NSW - 1;
 static int drawCol = 0;
 static bool stroking = false;
 static int lastX, lastY;
@@ -974,28 +996,344 @@ static uint16_t swatchColor(int i) {
   if (i == 7) return C_DARK;
   return TFT_WHITE;
 }
-static int swatchX(int i) { return 130 + i * 62; }
+static int swatchX(int i) { return 108 + i * 52; }
+static const int SAVE_BX = 600, GALLERY_BX = 680;
 
-static void drawDrawBar() {
-  tft.startWrite();
+// camera: "take a picture" of the drawing
+static void drawSaveIcon(int cx, int cy) {
+  gfx->fillCircle(cx, cy, 24, TFT_WHITE);
+  gfx->fillRoundRect(cx - 16, cy - 8, 32, 21, 5, C_WALL);
+  gfx->fillRoundRect(cx - 7, cy - 13, 14, 7, 2, C_WALL);
+  gfx->fillCircle(cx, cy + 2, 8, TFT_WHITE);
+  gfx->fillCircle(cx, cy + 2, 5, RAINBOW[4]);
+  gfx->fillCircle(cx + 11, cy - 4, 2, C_FACE);
+}
+
+// a framed picture: the saved drawings
+static void drawGalleryIcon(int cx, int cy) {
+  gfx->fillCircle(cx, cy, 24, TFT_WHITE);
+  gfx->fillRoundRect(cx - 16, cy - 13, 32, 26, 4, C_WALL);
+  gfx->fillRect(cx - 12, cy - 9, 24, 18, C_BG);
+  gfx->fillTriangle(cx - 12, cy + 9, cx - 3, cy - 3, cx + 6, cy + 9, RAINBOW[3]);
+  gfx->fillTriangle(cx - 1, cy + 9, cx + 5, cy + 1, cx + 12, cy + 9, gfx->color565(40, 150, 60));
+  gfx->fillCircle(cx + 6, cy - 4, 3, C_FACE);
+}
+
+static void renderDrawBar() {
+  gfx->startWrite();
   drawPlainBar();
   int y = BAR / 2;
   for (int i = 0; i < NSW; i++) {
     int x = swatchX(i);
-    tft.fillCircle(x, y, 27, i == drawCol ? C_DARK : C_BAR);
-    tft.fillCircle(x, y, 22, swatchColor(i));
+    gfx->fillCircle(x, y, 25, i == drawCol ? C_DARK : C_BAR);
+    gfx->fillCircle(x, y, 20, swatchColor(i));
     if (i == NSW - 1) {  // eraser: white with a little pink band
-      tft.fillRoundRect(x - 14, y - 6, 28, 12, 4, C_STAR);
+      gfx->fillRoundRect(x - 13, y - 5, 26, 10, 4, C_STAR);
     }
   }
+  drawSaveIcon(SAVE_BX, y);
+  drawGalleryIcon(GALLERY_BX, y);
   drawNewButton();
-  tft.endWrite();
+  gfx->endWrite();
+}
+
+static void drawDrawBar() {
+  bool off = offscreenBegin();
+  renderDrawBar();
+  if (off) offscreenShow(0, BAR);
+}
+
+// ---- saved drawings
+// A drawing is kept as one palette index per pixel (the 9 paint colors), and
+// saved run-length packed, so mostly-white pictures stay small (a few KB).
+// Files are /kidsdraw/<number>.kd; a higher number is newer.
+// With a microSD card in the slot, drawings go on the card (up to 60). Without
+// one they go in the board's own flash (up to 6). Either way, saving past the
+// limit drops the oldest. Drawings already in flash move to the card when one
+// is put in.
+static const int CANVAS_H = SCREEN_H - BAR;
+static const int CANVAS_PX = SCREEN_W * CANVAS_H;
+static const char *SAVE_DIR = "/kidsdraw";
+static const int FLASH_MAX_SAVES = 6, SD_MAX_SAVES = 60;
+#define SD_CS   10  // microSD slot (SPI)
+#define SD_MOSI 11
+#define SD_SCK  12
+#define SD_MISO 13
+
+static uint8_t *canvasIdx = nullptr;  // the drawing on screen (PSRAM)
+static uint8_t *loadIdx = nullptr;    // scratch for reading saves (PSRAM)
+static uint16_t *canvasBackup = nullptr;  // exact copy of the drawing while the gallery is open
+static bool haveBackup = false;
+static bool flashReady = false, sdReady = false;
+static uint32_t lastSdTry = 0;
+static fs::FS *store = nullptr;       // where drawings go right now
+static int maxSaves = 0;
+static std::vector<int> saveIds;      // drawings in the store, newest first
+static uint16_t pal565[NSW];
+static uint8_t palR[NSW], palG[NSW], palB[NSW];
+
+static String savePath(int id) { return String(SAVE_DIR) + "/" + id + ".kd"; }
+
+static void listIds(fs::FS &fs, std::vector<int> &ids) {
+  ids.clear();
+  File dir = fs.open(SAVE_DIR);
+  if (!dir || !dir.isDirectory()) return;
+  for (File f = dir.openNextFile(); f; f = dir.openNextFile()) {
+    String n = f.name();
+    int slash = n.lastIndexOf('/');
+    if (slash >= 0) n = n.substring(slash + 1);
+    if (!f.isDirectory() && n.endsWith(".kd")) {
+      int id = n.toInt();
+      if (id > 0) ids.push_back(id);
+    }
+  }
+  std::sort(ids.begin(), ids.end(), std::greater<int>());
+}
+
+static bool mountSD() {
+  static bool spiStarted = false;
+  if (!spiStarted) { SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS); spiStarted = true; }
+  lastSdTry = millis();
+  if (!SD.begin(SD_CS, SPI, 20000000) || SD.cardType() == CARD_NONE ||
+      (!SD.exists(SAVE_DIR) && !SD.mkdir(SAVE_DIR))) {
+    SD.end();
+    return false;
+  }
+  Serial.printf("SD card: %u MB\n", (unsigned)(SD.cardSize() / (1024 * 1024)));
+  return true;
+}
+
+static bool copyFile(fs::FS &from, const String &src, fs::FS &to, const String &dst) {
+  File in = from.open(src, "r");
+  if (!in) return false;
+  File out = to.open(dst, "w");
+  if (!out) { in.close(); return false; }
+  static uint8_t buf[1024];
+  bool ok = true;
+  size_t n;
+  while (ok && (n = in.read(buf, sizeof(buf))) > 0) ok = out.write(buf, n) == n;
+  in.close();
+  out.close();
+  if (!ok) to.remove(dst);
+  return ok;
+}
+
+// drawings saved in flash while there was no card: move them onto the card, oldest first
+static void moveFlashToSD() {
+  if (!flashReady) return;
+  std::vector<int> fromFlash, onCard;
+  listIds(LittleFS, fromFlash);
+  if (fromFlash.empty()) return;
+  listIds(SD, onCard);
+  int next = onCard.empty() ? 1 : onCard[0] + 1;
+  for (int i = (int)fromFlash.size() - 1; i >= 0; i--) {
+    if (copyFile(LittleFS, savePath(fromFlash[i]), SD, savePath(next))) {
+      LittleFS.remove(savePath(fromFlash[i]));
+      next++;
+    }
+  }
+  Serial.printf("Moved %u drawings to the SD card\n", (unsigned)fromFlash.size());
+}
+
+// pick the card if there is one (it can be put in or taken out any time), else flash
+static void chooseStore() {
+  if (sdReady && !SD.exists(SAVE_DIR)) { SD.end(); sdReady = false; }  // card taken out
+  if (!sdReady && (store != &LittleFS || millis() - lastSdTry > 3000)) sdReady = mountSD();
+  if (sdReady) { store = &SD; maxSaves = SD_MAX_SAVES; moveFlashToSD(); }
+  else if (flashReady) { store = &LittleFS; maxSaves = FLASH_MAX_SAVES; }
+  else store = nullptr;
+  if (store) listIds(*store, saveIds);
+  else saveIds.clear();
+}
+
+static void initDrawStorage() {
+  for (int i = 0; i < NSW; i++) {
+    uint16_t c = swatchColor(i);
+    pal565[i] = c;
+    palR[i] = ((c >> 11) & 31) * 255 / 31;
+    palG[i] = ((c >> 5) & 63) * 255 / 63;
+    palB[i] = (c & 31) * 255 / 31;
+  }
+  canvasIdx = (uint8_t *)ps_malloc(CANVAS_PX);
+  loadIdx = (uint8_t *)ps_malloc(CANVAS_PX);
+  canvasBackup = (uint16_t *)ps_malloc(CANVAS_PX * 2);
+  screenSpr.setPsram(true);
+  screenSpr.setColorDepth(16);
+  if (!screenSpr.createSprite(SCREEN_W, SCREEN_H)) Serial.println("No memory for off-screen drawing");
+  if (!canvasIdx || !loadIdx) { Serial.println("Drawing storage not available"); return; }
+  flashReady = LittleFS.begin(true);  // formats on first use
+  if (flashReady && !LittleFS.exists(SAVE_DIR)) LittleFS.mkdir(SAVE_DIR);
+  chooseStore();
+  Serial.printf("Drawings: %u saved on %s\n", (unsigned)saveIds.size(),
+                store == &SD ? "the SD card" : store ? "flash" : "nothing (no storage)");
+}
+
+// read the canvas back from the screen, snapping each pixel to the nearest paint color
+static void captureCanvas(uint8_t *dst) {
+  static lgfx::rgb888_t row[SCREEN_W];
+  for (int y = 0; y < CANVAS_H; y++) {
+    tft.readRect(0, BAR + y, SCREEN_W, 1, row);
+    uint8_t *out = dst + y * SCREEN_W;
+    int lr = -1, lg = -1, lb = -1, li = PAPER;
+    for (int x = 0; x < SCREEN_W; x++) {
+      int r = row[x].r, g = row[x].g, b = row[x].b;
+      if (r != lr || g != lg || b != lb) {  // same as the last pixel: reuse the answer
+        int best = PAPER, bestD = INT32_MAX;
+        for (int i = 0; i < NSW; i++) {
+          int dr = r - palR[i], dg = g - palG[i], db = b - palB[i];
+          int d = dr * dr + dg * dg + db * db;
+          if (d < bestD) { bestD = d; best = i; }
+        }
+        lr = r; lg = g; lb = b; li = best;
+      }
+      out[x] = li;
+    }
+  }
+}
+
+static void paintCanvas(const uint8_t *src) {
+  gfx->startWrite();
+  for (int y = 0; y < CANVAS_H; y++) {
+    const uint8_t *row = src + y * SCREEN_W;
+    int x = 0;
+    while (x < SCREEN_W) {
+      int len = 1;
+      while (x + len < SCREEN_W && row[x + len] == row[x]) len++;
+      gfx->writeFastHLine(x, BAR + y, len, pal565[row[x]]);
+      x += len;
+    }
+  }
+  gfx->endWrite();
+}
+
+static bool canvasBlank(const uint8_t *src) {
+  for (int i = 0; i < CANVAS_PX; i++) if (src[i] != PAPER) return false;
+  return true;
+}
+
+// file: "KD", version 1, canvas height (2 bytes), then (color, run length) pairs
+static bool writeDrawing(fs::FS &fs, const String &path, const uint8_t *src) {
+  File f = fs.open(path, "w");
+  if (!f) return false;
+  uint8_t hdr[5] = {'K', 'D', 1, (uint8_t)(CANVAS_H & 0xFF), (uint8_t)(CANVAS_H >> 8)};
+  bool ok = f.write(hdr, 5) == 5;
+  static uint8_t buf[512];
+  int n = 0;
+  for (int y = 0; y < CANVAS_H && ok; y++) {
+    const uint8_t *row = src + y * SCREEN_W;
+    int x = 0;
+    while (x < SCREEN_W) {
+      int len = 1;
+      while (x + len < SCREEN_W && len < 255 && row[x + len] == row[x]) len++;
+      buf[n++] = row[x];
+      buf[n++] = len;
+      x += len;
+      if (n >= (int)sizeof(buf)) { ok = ok && f.write(buf, n) == (size_t)n; n = 0; }
+    }
+  }
+  if (n && ok) ok = f.write(buf, n) == (size_t)n;
+  f.close();
+  return ok;
+}
+
+static bool readDrawing(fs::FS &fs, const String &path, uint8_t *dst) {
+  File f = fs.open(path, "r");
+  if (!f) return false;
+  size_t sz = f.size();
+  if (sz < 7 || sz > 5 + 2 * (size_t)CANVAS_PX) { f.close(); return false; }
+  uint8_t *data = (uint8_t *)ps_malloc(sz);
+  if (!data) { f.close(); return false; }
+  bool ok = f.read(data, sz) == sz;
+  f.close();
+  ok = ok && data[0] == 'K' && data[1] == 'D' && data[2] == 1 &&
+       (data[3] | (data[4] << 8)) == CANVAS_H;
+  size_t p = 5;
+  int out = 0;
+  while (ok && p + 1 < sz && out < CANVAS_PX) {
+    uint8_t c = data[p], len = data[p + 1];
+    p += 2;
+    if (c >= NSW || len == 0 || out + len > CANVAS_PX) { ok = false; break; }
+    memset(dst + out, c, len);
+    out += len;
+  }
+  free(data);
+  return ok && out == CANVAS_PX;
+}
+
+static bool saveDrawing(const uint8_t *src) {
+  chooseStore();
+  if (!store) return false;
+  int id = saveIds.empty() ? 1 : saveIds[0] + 1;
+  bool ok = writeDrawing(*store, savePath(id), src);
+  if (!ok && !saveIds.empty() && (int)saveIds.size() >= maxSaves) {  // full: make room, try again
+    store->remove(savePath(saveIds.back()));
+    saveIds.pop_back();
+    ok = writeDrawing(*store, savePath(id), src);
+  }
+  if (!ok) { store->remove(savePath(id)); return false; }
+  saveIds.insert(saveIds.begin(), id);
+  while ((int)saveIds.size() > maxSaves) {
+    store->remove(savePath(saveIds.back()));
+    saveIds.pop_back();
+  }
+  return true;
 }
 
 static void startDraw() {
-  tft.fillScreen(TFT_WHITE);
-  drawDrawBar();
+  bool off = offscreenBegin();
+  gfx->fillScreen(TFT_WHITE);
+  renderDrawBar();
+  if (off) offscreenShow(0, SCREEN_H);
   stroking = false;
+}
+
+// keep an exact copy of the drawing on screen before the gallery covers it
+static void backupCanvas() {
+  haveBackup = canvasBackup != nullptr;
+  if (haveBackup) tft.readRect(0, BAR, SCREEN_W, CANVAS_H, (lgfx::swap565_t *)canvasBackup);
+  else captureCanvas(canvasIdx);
+}
+
+// back to drawing: the picture from before the gallery (fromBackup), or the one
+// just opened from it (in canvasIdx). Built off-screen, then shown in one go.
+static void resumeDraw(bool fromBackup) {
+  app = APP_DRAW;
+  ignoreUntilRelease = true;
+  stroking = false;
+  bool off = offscreenBegin();
+  if (fromBackup && haveBackup) {
+    if (off) memcpy((uint16_t *)screenSpr.getBuffer() + BAR * SCREEN_W, canvasBackup, CANVAS_PX * 2);
+    else tft.pushImage(0, BAR, SCREEN_W, CANVAS_H, (lgfx::swap565_t *)canvasBackup);
+  } else {
+    paintCanvas(canvasIdx);
+  }
+  renderDrawBar();
+  if (off) offscreenShow(0, SCREEN_H);
+}
+
+static void startGallery();
+
+static void showSaved(bool ok) {
+  int y = BAR / 2;
+  tft.startWrite();
+  tft.fillCircle(SAVE_BX, y, 24, ok ? RAINBOW[3] : RAINBOW[0]);
+  if (ok) {  // a check mark
+    tft.drawWideLine(SAVE_BX - 11, y + 1, SAVE_BX - 3, y + 9, 3, TFT_WHITE);
+    tft.drawWideLine(SAVE_BX - 3, y + 9, SAVE_BX + 12, y - 8, 3, TFT_WHITE);
+  } else {   // an X
+    tft.drawWideLine(SAVE_BX - 9, y - 9, SAVE_BX + 9, y + 9, 3, TFT_WHITE);
+    tft.drawWideLine(SAVE_BX - 9, y + 9, SAVE_BX + 9, y - 9, 3, TFT_WHITE);
+  }
+  tft.endWrite();
+  delay(700);
+  tft.startWrite();
+  drawSaveIcon(SAVE_BX, y);
+  tft.endWrite();
+}
+
+static bool barButtonPressed(bool pressed, int32_t tx, int32_t ty, int bx) {
+  int dx = tx - bx, dy = ty - BAR / 2;
+  return pressed && ty < BAR && dx * dx + dy * dy < 30 * 30;
 }
 
 static void drawTick(bool touching, bool pressed, int32_t tx, int32_t ty) {
@@ -1005,17 +1343,42 @@ static void drawTick(bool touching, bool pressed, int32_t tx, int32_t ty) {
     tft.fillRect(0, BAR, SCREEN_W, SCREEN_H - BAR, TFT_WHITE);
     return;
   }
+  if (barButtonPressed(pressed, tx, ty, SAVE_BX)) {
+    stroking = false;
+    if (!canvasIdx) { playSound(SND_NOPE); return; }
+    captureCanvas(canvasIdx);
+    if (canvasBlank(canvasIdx)) { playSound(SND_NOPE); return; }  // nothing drawn yet
+    bool ok = saveDrawing(canvasIdx);
+    playSound(ok ? SND_MATCH : SND_NOPE);
+    showSaved(ok);
+    ignoreUntilRelease = true;
+    return;
+  }
+  if (barButtonPressed(pressed, tx, ty, GALLERY_BX)) {
+    stroking = false;
+    if (!canvasIdx) { playSound(SND_NOPE); return; }
+    playSound(SND_TAP);
+    backupCanvas();  // keep the current drawing for when we come back
+    startGallery();
+    return;
+  }
   if (pressed && ty < BAR) {
+    int best = -1, bestD = 30 * 30;
     for (int i = 0; i < NSW; i++) {
       int dx = tx - swatchX(i), dy = ty - BAR / 2;
-      if (dx * dx + dy * dy < 31 * 31) { drawCol = i; playSound(SND_COLOR); drawDrawBar(); break; }
+      if (dx * dx + dy * dy < bestD) { bestD = dx * dx + dy * dy; best = i; }
     }
+    if (best >= 0) { drawCol = best; playSound(SND_COLOR); drawDrawBar(); }
     stroking = false;
     return;
   }
   if (!touching || ty < BAR) { stroking = false; return; }
   int brush = drawCol == NSW - 1 ? 24 : 12;
   uint16_t col = swatchColor(drawCol);
+  // keep the whole brush below the top bar (the line's soft edge spills 1-2 px more),
+  // so paint never lands on the buttons, near the top of the page included
+  int minY = BAR + brush + 2;
+  if (ty < minY) ty = minY;
   tft.startWrite();
   tft.setClipRect(0, BAR, SCREEN_W, SCREEN_H - BAR);
   if (!stroking) tft.fillCircle(tx, ty, brush, col);
@@ -1025,6 +1388,189 @@ static void drawTick(bool touching, bool pressed, int32_t tx, int32_t ty) {
   stroking = true;
   lastX = tx;
   lastY = ty;
+}
+
+// ---------------------------------------------------------------- gallery
+// The saved drawings, newest first, 6 to a page. Tap one to keep drawing on it;
+// the arrow at the top left goes back to the drawing you had. With more than one
+// page, the arrows at the top right flip pages and the dots show which page.
+static const int TH_W = 240, TH_H = CANVAS_H * TH_W / SCREEN_W;  // 0.3 scale
+static const int PER_PAGE = 6;
+static const int PREV_BX = 680, NEXT_BX = 760;
+static int galleryPage = 0;
+static int thumbX(int i) { return 20 + (i % 3) * (TH_W + 20); }
+static int thumbY(int i) { return BAR + (CANVAS_H - 2 * TH_H - 44) / 2 + (i / 3) * (TH_H + 44); }
+static int galleryPages() { return max(1, ((int)saveIds.size() + PER_PAGE - 1) / PER_PAGE); }
+static int pageCount(int page) { return min(PER_PAGE, (int)saveIds.size() - page * PER_PAGE); }
+
+static void drawBackButton() {
+  int bx = 40, by = BAR / 2;
+  gfx->fillCircle(bx, by, 24, TFT_WHITE);
+  gfx->fillTriangle(bx - 16, by, bx - 2, by - 14, bx - 2, by + 14, C_WALL);
+  gfx->fillRoundRect(bx - 4, by - 5, 20, 10, 3, C_WALL);
+}
+
+// page arrow: dir -1 = previous, +1 = next; faded when there's no page that way
+static void drawPageArrow(int bx, int dir, bool active) {
+  int by = BAR / 2;
+  gfx->fillCircle(bx, by, 24, active ? TFT_WHITE : C_BG);
+  uint16_t col = active ? C_WALL : C_BAR;
+  gfx->fillTriangle(bx + dir * 12, by, bx - dir * 8, by - 14, bx - dir * 8, by + 14, col);
+}
+
+// Delete button in each picture's top right corner. It takes two taps so little
+// fingers don't delete by accident: the first turns it big and red ("armed"),
+// a second tap within 3 seconds deletes; otherwise it goes back to normal.
+static int armedSlot = -1;  // slot on this page whose X is armed, or -1
+static uint32_t armedAt = 0;
+static const uint32_t ARM_MS = 3000;
+static void deleteXCenter(int slot, int &cx, int &cy) {
+  cx = thumbX(slot) + TH_W - 10;
+  cy = thumbY(slot) + 10;
+}
+
+static void drawDeleteX(int slot, bool armed) {
+  int cx, cy;
+  deleteXCenter(slot, cx, cy);
+  int r = armed ? 21 : 16, a = armed ? 8 : 6;
+  gfx->fillCircle(cx, cy, r, armed ? RAINBOW[0] : TFT_WHITE);
+  if (!armed) gfx->drawCircle(cx, cy, r, C_DARK);
+  uint16_t col = armed ? TFT_WHITE : C_DARK;
+  gfx->drawWideLine(cx - a, cy - a, cx + a, cy + a, armed ? 3 : 2, col);
+  gfx->drawWideLine(cx - a, cy + a, cx + a, cy - a, armed ? 3 : 2, col);
+}
+
+static void drawThumb(int slot, int index) {
+  int x = thumbX(slot), y = thumbY(slot);
+  gfx->fillRoundRect(x - 8, y - 8, TH_W + 16, TH_H + 16, 12, RAINBOW[index % 7]);
+  if (!store || !readDrawing(*store, savePath(saveIds[index]), loadIdx)) {
+    gfx->fillRect(x, y, TH_W, TH_H, TFT_WHITE);
+  } else {
+    static uint16_t row[TH_W];
+    for (int ty = 0; ty < TH_H; ty++) {
+      const uint8_t *src = loadIdx + (ty * CANVAS_H / TH_H) * SCREEN_W;
+      for (int tx = 0; tx < TH_W; tx++) row[tx] = pal565[src[tx * SCREEN_W / TH_W]];
+      gfx->pushImage(x, y + ty, TH_W, 1, (lgfx::rgb565_t *)row);
+    }
+  }
+  drawDeleteX(slot, false);
+}
+
+// put an armed X back to normal (redraws just that picture, off-screen first)
+static void disarmDelete() {
+  if (armedSlot < 0) return;
+  int slot = armedSlot;
+  armedSlot = -1;
+  bool off = offscreenBegin();
+  drawThumb(slot, galleryPage * PER_PAGE + slot);
+  if (off) {
+    int y = thumbY(slot) - 12;  // the armed X pokes a few pixels past the frame
+    offscreenShow(y, TH_H + 24);
+  }
+}
+
+static void renderGalleryPage() {
+  int pages = galleryPages();
+  gfx->startWrite();
+  gfx->fillScreen(C_BG);
+  gfx->fillRect(0, 0, SCREEN_W, BAR, C_BAR);
+  drawBackButton();
+  if (pages > 1) {
+    drawPageArrow(PREV_BX, -1, galleryPage > 0);
+    drawPageArrow(NEXT_BX, +1, galleryPage < pages - 1);
+    int spacing = min(28, 440 / pages);
+    int x0 = 370 - (pages - 1) * spacing / 2;
+    for (int p = 0; p < pages; p++)
+      gfx->fillCircle(x0 + p * spacing, BAR / 2, p == galleryPage ? 9 : 5,
+                     p == galleryPage ? TFT_WHITE : C_BG);
+  }
+  gfx->endWrite();
+  if (saveIds.empty()) {  // nothing saved yet: a big empty picture frame
+    int cx = SCREEN_W / 2, cy = BAR + CANVAS_H / 2;
+    gfx->startWrite();
+    gfx->fillRoundRect(cx - 130, cy - 100, 260, 200, 20, C_WALL);
+    gfx->fillRoundRect(cx - 110, cy - 80, 220, 160, 10, C_FLOOR);
+    drawSaveIcon(cx, cy);
+    gfx->endWrite();
+    return;
+  }
+  int n = pageCount(galleryPage);
+  for (int i = 0; i < n; i++) drawThumb(i, galleryPage * PER_PAGE + i);
+}
+
+// the whole page is built off-screen and shown in one go
+static void drawGalleryPage() {
+  armedSlot = -1;
+  bool off = offscreenBegin();
+  renderGalleryPage();
+  if (off) offscreenShow(0, SCREEN_H);
+}
+
+static void startGallery() {
+  app = APP_GALLERY;
+  ignoreUntilRelease = true;
+  chooseStore();
+  galleryPage = 0;
+  drawGalleryPage();
+}
+
+static void deleteDrawing(int slot) {
+  int index = galleryPage * PER_PAGE + slot;
+  if (store) store->remove(savePath(saveIds[index]));
+  saveIds.erase(saveIds.begin() + index);
+  if (galleryPage >= galleryPages()) galleryPage = galleryPages() - 1;
+  playSound(SND_CLEAR);
+  drawGalleryPage();
+}
+
+static void galleryTick(bool pressed, int32_t tx, int32_t ty) {
+  if (armedSlot >= 0 && millis() - armedAt > ARM_MS) disarmDelete();
+  if (!pressed) return;
+  int n = pageCount(galleryPage);
+  for (int i = 0; i < n; i++) {  // delete X (checked before the picture under it)
+    int cx, cy;
+    deleteXCenter(i, cx, cy);
+    int dx = tx - cx, dy = ty - cy;
+    if (dx * dx + dy * dy < 28 * 28) {
+      ignoreUntilRelease = true;
+      if (armedSlot == i) { deleteDrawing(i); return; }
+      disarmDelete();
+      armedSlot = i;
+      armedAt = millis();
+      tft.startWrite();
+      drawDeleteX(i, true);
+      tft.endWrite();
+      playSound(SND_NOPE);
+      return;
+    }
+  }
+  disarmDelete();  // tapping anywhere else cancels
+  if (ty < BAR && tx < 90) { playSound(SND_TAP); resumeDraw(true); return; }
+  int pages = galleryPages();
+  if (pages > 1 && barButtonPressed(pressed, tx, ty, PREV_BX)) {
+    if (galleryPage > 0) { galleryPage--; playSound(SND_FLIP); drawGalleryPage(); }
+    else playSound(SND_NOPE);
+    ignoreUntilRelease = true;
+    return;
+  }
+  if (pages > 1 && barButtonPressed(pressed, tx, ty, NEXT_BX)) {
+    if (galleryPage < pages - 1) { galleryPage++; playSound(SND_FLIP); drawGalleryPage(); }
+    else playSound(SND_NOPE);
+    ignoreUntilRelease = true;
+    return;
+  }
+  for (int i = 0; i < n; i++) {
+    int x = thumbX(i), y = thumbY(i);
+    if (tx >= x - 8 && tx < x + TH_W + 8 && ty >= y - 8 && ty < y + TH_H + 8) {
+      if (store && readDrawing(*store, savePath(saveIds[galleryPage * PER_PAGE + i]), canvasIdx)) {
+        playSound(SND_FLIP);
+        resumeDraw(false);
+      } else {
+        playSound(SND_NOPE);
+      }
+      return;
+    }
+  }
 }
 
 // ---------------------------------------------------------------- bubbles app
@@ -1261,6 +1807,7 @@ void setup() {
   initColors();
   initSound();      // also opens the saved settings
   initBacklight();  // turns the screen on at the saved brightness
+  initDrawStorage();
   Serial.printf("Display up (brightness %c)\n", "LMH"[brightLevel]);
 
   drawHome();
@@ -1306,6 +1853,7 @@ void loop() {
     case APP_DRAW: drawTick(touching, pressed, tx, ty); break;
     case APP_BUBBLES: bubblesTick(touching, pressed, tx, ty); break;
     case APP_MEMORY: memoryTick(touching, pressed, tx, ty); break;
+    case APP_GALLERY: galleryTick(pressed, tx, ty); break;
   }
   delay(app == APP_BUBBLES || app == APP_DRAW ? 2 : 10);
 }

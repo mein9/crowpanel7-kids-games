@@ -19,11 +19,32 @@ A home screen with four big tiles. A house button (top left) in each game goes b
   and grow to 6×4. Movement is forgiving: the character follows the finger if it's
   up to two squares ahead along the path. Each win adds a gold star at the top.
 - **Draw**: finger painting with 7 rainbow colors, dark, and an eraser. The
-  round-arrow button clears the page.
+  round-arrow button clears the page. The **camera** button saves the picture
+  (a green check means it's saved), and the **picture-frame** button opens the
+  gallery of saved drawings, newest first. Tap one to keep drawing on it, or the
+  arrow to go back. To delete one, tap the **X** in its corner (it turns red),
+  then tap it again within 3 seconds. See [Saved drawings](#saved-drawings) for
+  where they're kept.
 - **Bubbles**: colorful bubbles float up; touch them to pop. Drawn off-screen
   first, so there's no flicker.
 - **Memory**: flip two cards to find a match (star, cat, car, dino, heart, ball).
   Switches between 3 and 4 pairs.
+
+## Saved drawings
+
+Without a card, the board keeps up to **6** drawings in its own flash. With a
+**microSD card** in the slot, it keeps up to **60** on the card, and the gallery
+gets page arrows (6 drawings per page). Saving past the limit drops the oldest.
+
+- Use a card formatted **FAT32** (most cards up to 32 GB come that way).
+- Drawings already saved in flash move onto the card the first time it's used.
+- The card can go in or come out any time. The board checks for it when you
+  save or open the gallery.
+- Drawings are in the `kidsdraw` folder on the card. They're stored in a small
+  custom format (`.kd`), not as images.
+- Drawings in flash survive unplugging and reflashing.
+
+SD slot: SPI on GPIO 10 (CS), 11 (MOSI), 12 (SCK) and 13 (MISO).
 
 ## Brightness and screen sleep
 
