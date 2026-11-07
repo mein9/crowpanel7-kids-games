@@ -4,6 +4,12 @@ Simple touchscreen games for toddlers (made for a 3-year-old), running on the
 **Elecrow CrowPanel 7.0 (basic)** ESP32-S3 display. No reading needed: big
 pictures, big touch targets, and a confetti party for every win.
 
+![Home screen with Maze, Draw, Bubbles and Memory tiles, plus brightness and volume buttons](docs/home.jpg)
+
+| Maze | Reaching the star |
+|---|---|
+| ![A red car at the start of a small maze, with a pink star as the goal](docs/maze.jpg) | ![Confetti and a big car celebrating a finished maze](docs/win.jpg) |
+
 ## Games
 
 A home screen with four big tiles. A house button (top left) in each game goes back home.
