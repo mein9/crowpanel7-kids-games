@@ -262,6 +262,34 @@ static void setMuted(bool m) {
   if (m && soundQ) xQueueReset(soundQ);
 }
 
+// ---------------------------------------------------------------- backlight
+// Brightness via PWM on the backlight pin, plus screen sleep:
+// dims after DIM_AFTER_MS without a touch, turns off after OFF_AFTER_MS.
+static const int BL_CHANNEL = 0;
+static const uint8_t BRIGHT_LEVELS[3] = {70, 160, 255};  // Low / Medium / High
+static int brightLevel = 2;
+enum ScreenState { SCREEN_AWAKE, SCREEN_DIM, SCREEN_OFF };
+static ScreenState screenState = SCREEN_AWAKE;
+static uint32_t lastActivity = 0;
+static const uint32_t DIM_AFTER_MS = 2UL * 60 * 1000;
+static const uint32_t OFF_AFTER_MS = 5UL * 60 * 1000;
+
+static void setBacklight(uint8_t duty) { ledcWrite(BL_CHANNEL, duty); }
+
+static void initBacklight() {
+  brightLevel = constrain(prefs.getUChar("bright", 2), 0, 2);
+  ledcSetup(BL_CHANNEL, 5000, 8);
+  ledcAttachPin(PIN_BL, BL_CHANNEL);
+  setBacklight(BRIGHT_LEVELS[brightLevel]);
+  lastActivity = millis();
+}
+
+static void setBrightLevel(int level) {
+  brightLevel = level;
+  prefs.putUChar("bright", level);  // remembered across power cycles
+  setBacklight(BRIGHT_LEVELS[level]);
+}
+
 // ---------------------------------------------------------------- maze
 struct Level { uint8_t cols, rows; };
 static const Level LEVELS[] = {{3, 2}, {4, 2}, {4, 3}, {5, 3}, {5, 4}, {6, 4}};
@@ -763,6 +791,30 @@ static void drawSoundButton() {
   }
 }
 
+// Top left of the home screen: a sun icon, then L / M / H brightness buttons
+// (mirrors the sound controls on the right).
+static const int BRIGHT_BY = 32;
+static int brightBtnX(int level) { return 96 + level * 56; }
+
+static void drawBrightButtons() {
+  int sx = 40, sy = BRIGHT_BY;
+  tft.fillCircle(sx, sy, 24, TFT_WHITE);
+  for (int k = 0; k < 8; k++) {  // sun rays
+    float a = k * PI / 4;
+    tft.drawWideLine(sx + cosf(a) * 12, sy + sinf(a) * 12, sx + cosf(a) * 18, sy + sinf(a) * 18, 2, C_FACE_EDGE);
+  }
+  tft.fillCircle(sx, sy, 9, C_FACE);
+  tft.setFont(&fonts::FreeSansBold12pt7b);
+  tft.setTextDatum(textdatum_t::middle_center);
+  for (int l = 0; l < 3; l++) {
+    bool on = (l == brightLevel);
+    int x = brightBtnX(l);
+    tft.fillCircle(x, BRIGHT_BY, 22, on ? C_WALL : TFT_WHITE);
+    tft.setTextColor(on ? TFT_WHITE : C_WALL);
+    tft.drawString(l == 0 ? "L" : l == 1 ? "M" : "H", x, BRIGHT_BY + 1);
+  }
+}
+
 static void drawHome() {
   static const char* labels[4] = {"Maze", "Draw", "Bubbles", "Memory"};
   uint16_t fills[4] = {tft.color565(215, 195, 255), tft.color565(255, 222, 175),
@@ -773,6 +825,7 @@ static void drawHome() {
   tft.setFont(&fonts::FreeSansBold24pt7b);
   tft.setTextColor(C_WALL);
   tft.drawString("Let's Play!", SCREEN_W / 2, 32);
+  drawBrightButtons();
   drawSoundButton();
   for (int i = 0; i < 4; i++) {
     int x = tileX(i), y = tileY(i);
@@ -843,6 +896,17 @@ static void homeTick(bool pressed, int32_t tx, int32_t ty) {
     tft.endWrite();
     playSound(SND_TAP);  // only heard when sound was just turned on
     return;
+  }
+  for (int l = 0; l < 3; l++) {
+    int bx = tx - brightBtnX(l), by = ty - BRIGHT_BY;
+    if (bx * bx + by * by < 27 * 27) {  // pick a brightness
+      setBrightLevel(l);
+      tft.startWrite();
+      drawBrightButtons();
+      tft.endWrite();
+      playSound(SND_TAP);
+      return;
+    }
   }
   for (int l = 0; l < 3; l++) {
     int vx = tx - volBtnX(l), vy = ty - SOUND_BY;
@@ -1195,9 +1259,9 @@ void setup() {
   tft.configure(touchAddr);
   if (!tft.init()) Serial.println("Display init FAILED");
   initColors();
-  digitalWrite(PIN_BL, HIGH);
-  Serial.println("Display up");
-  initSound();
+  initSound();      // also opens the saved settings
+  initBacklight();  // turns the screen on at the saved brightness
+  Serial.printf("Display up (brightness %c)\n", "LMH"[brightLevel]);
 
   drawHome();
   playSound(SND_START);
@@ -1208,6 +1272,27 @@ void loop() {
   bool touching = tft.getTouch(&tx, &ty);
   bool pressed = touching && !wasTouching;
   wasTouching = touching;
+
+  // screen sleep: dim, then off, after a while without touches; a touch wakes it
+  if (touching) {
+    lastActivity = millis();
+    if (screenState != SCREEN_AWAKE) {
+      // a tap on a dark screen only wakes it; on a dimmed screen it also works normally
+      if (screenState == SCREEN_OFF) ignoreUntilRelease = true;
+      screenState = SCREEN_AWAKE;
+      setBacklight(BRIGHT_LEVELS[brightLevel]);
+    }
+  } else {
+    uint32_t idle = millis() - lastActivity;
+    if (screenState == SCREEN_AWAKE && idle > DIM_AFTER_MS) {
+      screenState = SCREEN_DIM;
+      setBacklight(max(10, BRIGHT_LEVELS[brightLevel] / 3));
+    } else if (screenState == SCREEN_DIM && idle > OFF_AFTER_MS) {
+      screenState = SCREEN_OFF;
+      setBacklight(0);
+    }
+  }
+  if (screenState == SCREEN_OFF) { delay(20); return; }  // pause the games while dark
 
   // after switching screens, ignore the finger until it lifts
   if (ignoreUntilRelease) {

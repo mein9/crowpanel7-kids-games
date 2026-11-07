@@ -19,6 +19,17 @@ A home screen with four big tiles. A house button (top left) in each game goes b
 - **Memory**: flip two cards to find a match (star, cat, car, dino, heart, ball).
   Switches between 3 and 4 pairs.
 
+## Brightness and screen sleep
+
+At the top left of the home screen, the sun icon and **L / M / H** set the screen
+brightness. It's remembered after the board is unplugged.
+
+With no touches, the screen dims after **2 minutes** and turns off after
+**5 minutes** (the games pause while it's dark). A touch brings it back: on a
+dimmed screen the touch works as normal, and the tap that wakes a dark screen
+is ignored so nothing gets pressed by accident. Change `DIM_AFTER_MS` and
+`OFF_AFTER_MS` in `src/main.cpp` for different timings.
+
 ## Sound
 
 Plug a small speaker (4–8 Ω, around 1–3 W) into the board's **SPK** connector.
