@@ -166,7 +166,10 @@ static const Melody MELODIES[] = {
 
 static QueueHandle_t soundQ = nullptr;
 static bool muted = false;
-static const int MASTER_VOLUME = 9000;  // peak sample value at vol 100 (of 32767): kid-friendly
+// peak sample value (of 32767) for Low / Medium / High
+static const int VOLUME_LEVELS[3] = {3500, 9000, 20000};
+static int volumeLevel = 1;  // 0 L, 1 M, 2 H
+static volatile int masterVolume = 9000;
 
 static void playSound(Snd id, uint8_t pitch = 100) {
   if (muted || !soundQ) return;
@@ -200,7 +203,7 @@ static void audioTask(void *) {
             float env = i < attack ? (float)i / attack : (1 - pos) * (1 - pos) * 0.6f + (1 - pos) * 0.4f;
             s = (sinf(phase) + 0.2f * sinf(2 * phase)) * env * tn.vol / 100.0f;
           }
-          int16_t v = (int16_t)(s * MASTER_VOLUME);
+          int16_t v = (int16_t)(s * masterVolume);
           buf[2 * k] = v;
           buf[2 * k + 1] = v;
         }
@@ -217,6 +220,8 @@ static void audioTask(void *) {
 static void initSound() {
   prefs.begin("kidgames", false);
   muted = prefs.getBool("muted", false);
+  volumeLevel = constrain(prefs.getUChar("vol", 1), 0, 2);
+  masterVolume = VOLUME_LEVELS[volumeLevel];
 
   i2s_config_t cfg = {};
   cfg.mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
@@ -242,7 +247,13 @@ static void initSound() {
 
   soundQ = xQueueCreate(6, sizeof(SoundReq));
   xTaskCreatePinnedToCore(audioTask, "audio", 4096, nullptr, 2, nullptr, 0);
-  Serial.printf("Sound ready (%s)\n", muted ? "muted" : "on");
+  Serial.printf("Sound ready (%s, volume %c)\n", muted ? "muted" : "on", "LMH"[volumeLevel]);
+}
+
+static void setVolumeLevel(int level) {
+  volumeLevel = level;
+  masterVolume = VOLUME_LEVELS[level];
+  prefs.putUChar("vol", level);  // remembered across power cycles
 }
 
 static void setMuted(bool m) {
@@ -720,9 +731,21 @@ static const int TILE_W = 370, TILE_H = 196;
 static int tileX(int i) { return 20 + (i % 2) * 390; }
 static int tileY(int i) { return 62 + (i / 2) * 208; }
 
-// speaker icon, top right of the home screen: tap to turn sound on/off
+// Top right of the home screen: L / M / H volume buttons, then a speaker icon
+// that turns sound on/off.
 static const int SOUND_BX = SCREEN_W - 40, SOUND_BY = 32;
+static int volBtnX(int level) { return SCREEN_W - 208 + level * 56; }
+
 static void drawSoundButton() {
+  tft.setFont(&fonts::FreeSansBold12pt7b);
+  tft.setTextDatum(textdatum_t::middle_center);
+  for (int l = 0; l < 3; l++) {
+    bool on = (l == volumeLevel) && !muted;
+    int x = volBtnX(l);
+    tft.fillCircle(x, SOUND_BY, 22, on ? C_WALL : TFT_WHITE);
+    tft.setTextColor(on ? TFT_WHITE : C_WALL);
+    tft.drawString(l == 0 ? "L" : l == 1 ? "M" : "H", x, SOUND_BY + 1);
+  }
   int bx = SOUND_BX, by = SOUND_BY;
   tft.fillCircle(bx, by, 24, TFT_WHITE);
   tft.fillRect(bx - 14, by - 6, 8, 12, C_WALL);                                // speaker body
@@ -820,6 +843,18 @@ static void homeTick(bool pressed, int32_t tx, int32_t ty) {
     tft.endWrite();
     playSound(SND_TAP);  // only heard when sound was just turned on
     return;
+  }
+  for (int l = 0; l < 3; l++) {
+    int vx = tx - volBtnX(l), vy = ty - SOUND_BY;
+    if (vx * vx + vy * vy < 27 * 27) {  // pick a volume (also un-mutes)
+      setVolumeLevel(l);
+      if (muted) setMuted(false);
+      tft.startWrite();
+      drawSoundButton();
+      tft.endWrite();
+      playSound(SND_TAP);  // test blip at the new volume
+      return;
+    }
   }
   for (int i = 0; i < 4; i++) {
     if (tx >= tileX(i) && tx < tileX(i) + TILE_W && ty >= tileY(i) && ty < tileY(i) + TILE_H) {

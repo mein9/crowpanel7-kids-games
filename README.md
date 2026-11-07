@@ -26,8 +26,9 @@ Sounds are generated in code (no audio files): a startup chime, a little tune as
 the maze character steps, a happy jingle for every win, bubble pops (big bubbles
 pop lower), card flips, a match chime, and taps on buttons.
 
-The **speaker button** at the top right of the home screen turns sound on and off.
-The setting is remembered after the board is unplugged. Without a speaker
+At the top right of the home screen, **L / M / H** set the volume (Low, Medium,
+High) and the **speaker button** turns sound on and off. Both settings are
+remembered after the board is unplugged. Without a speaker
 everything works the same, just silently.
 
 Speaker connector: NS4168 I2S amplifier on GPIO 17 (data), 18 (LRCLK) and 42 (BCLK).
