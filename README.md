@@ -15,9 +15,11 @@ pictures, big touch targets, and a confetti party for every win.
 A home screen with four big tiles. A house button (top left) in each game goes back home.
 
 - **Maze**: drag the character to the pink star. The cat, car and dino take turns,
-  gliding from square to square and leaving a rainbow trail. Mazes start tiny (3×2)
-  and grow to 6×4. Movement is forgiving: the character follows the finger if it's
-  up to two squares ahead along the path. Each win adds a gold star at the top.
+  gliding from square to square and leaving a rainbow trail. Each win makes the
+  next maze a little bigger, within the difficulty picked with **L / M / H** in
+  the top bar: L grows from 3×2 to 4×3, M from 4×3 to 6×4, and H from 6×4 to 8×5.
+  Movement is forgiving: the character follows the finger if it's up to two
+  squares ahead along the path. Each win adds a gold star at the top.
 - **Draw**: finger painting with 7 rainbow colors, dark, and an eraser. The
   round-arrow button clears the page. The **camera** button saves the picture
   (a green check means it's saved), and the **picture-frame** button opens the
@@ -28,13 +30,25 @@ A home screen with four big tiles. A house button (top left) in each game goes b
 - **Bubbles**: colorful bubbles float up; touch them to pop. Drawn off-screen
   first, so there's no flicker.
 - **Memory**: flip two cards to find a match (star, cat, car, dino, heart, ball).
-  Switches between 3 and 4 pairs.
+  **L / M / H** in the top bar set how many pairs: L switches between 2 and 3,
+  M between 3 and 4, and H between 5 and 6. On L, a wrong pair stays face up a
+  little longer.
+
+Both games remember their difficulty after the board is unplugged. Maze starts
+on L and Memory on M.
 
 ## Saved drawings
 
 Without a card, the board keeps up to **6** drawings in its own flash. With a
-**microSD card** in the slot, it keeps up to **60** on the card, and the gallery
-gets page arrows (6 drawings per page). Saving past the limit drops the oldest.
+**microSD card** in the slot, it keeps up to **1,000** on the card, and the
+gallery gets page arrows (6 drawings per page). The arrows wrap around, so
+"back" from the first page jumps to the oldest drawings. Up to 12 pages show as
+dots; past that, a page number like `3 / 40`. Saving past the limit drops the
+oldest.
+
+A drawing is only a few KB, so the card's size isn't what limits it: the cap
+keeps the gallery quick to open. Change `SD_MAX_SAVES` in `src/main.cpp` for a
+different limit.
 
 - Use a card formatted **FAT32** (most cards up to 32 GB come that way).
 - Drawings already saved in flash move onto the card the first time it's used.

@@ -312,10 +312,13 @@ static void setBrightLevel(int level) {
 
 // ---------------------------------------------------------------- maze
 struct Level { uint8_t cols, rows; };
-static const Level LEVELS[] = {{3, 2}, {4, 2}, {4, 3}, {5, 3}, {5, 4}, {6, 4}};
-static const int NUM_LEVELS = sizeof(LEVELS) / sizeof(LEVELS[0]);
-#define MAXC 6
-#define MAXR 4
+static const Level LEVELS[] = {{3, 2}, {4, 2}, {4, 3}, {5, 3}, {5, 4}, {6, 4}, {7, 4}, {7, 5}, {8, 5}};
+// Difficulty L / M / H picks a range of maze sizes; each win moves one size up
+// within the range: L 3x2 to 4x3, M 4x3 to 6x4, H 6x4 to 8x5.
+static const uint8_t BAND_FIRST[3] = {0, 2, 5}, BAND_LAST[3] = {2, 5, 8};
+static int mazeDiff = 0;  // 0 L, 1 M, 2 H (remembered)
+#define MAXC 8
+#define MAXR 5
 
 static const int8_t DX[4] = {0, 1, 0, -1};
 static const int8_t DY[4] = {-1, 0, 1, 0};
@@ -532,16 +535,40 @@ static void drawNewButton() {
                    ex - nx * 9 - tx * 2, ey - ny * 9 - ty * 2, C_WALL);
 }
 
+// L / M / H difficulty buttons, toward the right of the Maze and Memory top bars
+static int diffBtnX(int l) { return 560 + l * 56; }
+
+static void drawDiffButtons(int sel) {
+  int y = (TOP - 8) / 2;
+  tft.setFont(&fonts::FreeSansBold12pt7b);
+  tft.setTextDatum(textdatum_t::middle_center);
+  for (int l = 0; l < 3; l++) {
+    int x = diffBtnX(l);
+    tft.fillCircle(x, y, 22, l == sel ? C_WALL : TFT_WHITE);
+    tft.setTextColor(l == sel ? TFT_WHITE : C_WALL);
+    tft.drawString(l == 0 ? "L" : l == 1 ? "M" : "H", x, y + 1);
+  }
+}
+
+// which difficulty button was tapped, or -1
+static int diffPressed(bool pressed, int32_t tx, int32_t ty) {
+  if (!pressed || ty >= TOP - 8) return -1;
+  for (int l = 0; l < 3; l++)
+    if (abs(tx - diffBtnX(l)) < 28) return l;
+  return -1;
+}
+
 static void drawTopBar() {
   tft.fillRect(0, 0, SCREEN_W, TOP - 8, C_BAR);
   drawHomeButton();
-  // earned stars (up to 10 shown)
-  int shown = starsEarned % 11;
-  for (int i = 0; i < 10; i++) {
-    int cx = 120 + i * 52, cy = (TOP - 8) / 2;
+  // earned stars (up to 8 shown)
+  int shown = starsEarned % 9;
+  for (int i = 0; i < 8; i++) {
+    int cx = 116 + i * 50, cy = (TOP - 8) / 2;
     if (i < shown) drawStar(cx, cy, 22, C_FACE, C_FACE_EDGE);
     else tft.fillCircle(cx, cy, 6, tft.color565(200, 230, 255));
   }
+  drawDiffButtons(mazeDiff);
   drawNewButton();
 }
 
@@ -963,6 +990,17 @@ static void startMaze() {
 static void mazeTick(bool touching, bool pressed, int32_t tx, int32_t ty) {
   if (homePressed(pressed, tx, ty)) { playSound(SND_TAP); enterApp(APP_HOME); return; }
   if (newPressed(pressed, tx, ty)) { playSound(SND_TAP); startMaze(); return; }
+  int dl = diffPressed(pressed, tx, ty);
+  if (dl >= 0) {
+    playSound(SND_TAP);
+    if (dl != mazeDiff) {  // new difficulty: a new maze at the smallest size of that range
+      mazeDiff = dl;
+      prefs.putUChar("mazeDiff", dl);
+      level = BAND_FIRST[mazeDiff];
+      startMaze();
+    }
+    return;
+  }
   if (!touching || ty < oy || tx < ox || millis() - lastStep < 70) return;
   int cx = (tx - ox) / cell;
   int cy = (ty - oy) / cell;
@@ -978,7 +1016,7 @@ static void mazeTick(bool touching, bool pressed, int32_t tx, int32_t ty) {
   if (px == gx && py == gy) {
     playSound(SND_WIN);
     celebrate();
-    if (level < NUM_LEVELS - 1) level++;
+    if (level < BAND_LAST[mazeDiff]) level++;
     startMaze();
     waitForRelease();
   }
@@ -1054,7 +1092,9 @@ static void drawDrawBar() {
 static const int CANVAS_H = SCREEN_H - BAR;
 static const int CANVAS_PX = SCREEN_W * CANVAS_H;
 static const char *SAVE_DIR = "/kidsdraw";
-static const int FLASH_MAX_SAVES = 6, SD_MAX_SAVES = 60;
+// A drawing is a few KB, so a card could hold far more than 1000; the cap keeps
+// the gallery quick to open (it reads the whole folder).
+static const int FLASH_MAX_SAVES = 6, SD_MAX_SAVES = 1000;
 #define SD_CS   10  // microSD slot (SPI)
 #define SD_MOSI 11
 #define SD_SCK  12
@@ -1069,6 +1109,7 @@ static uint32_t lastSdTry = 0;
 static fs::FS *store = nullptr;       // where drawings go right now
 static int maxSaves = 0;
 static std::vector<int> saveIds;      // drawings in the store, newest first
+static fs::FS *listedStore = nullptr; // which store saveIds was read from
 static uint16_t pal565[NSW];
 static uint8_t palR[NSW], palG[NSW], palB[NSW];
 
@@ -1119,11 +1160,11 @@ static bool copyFile(fs::FS &from, const String &src, fs::FS &to, const String &
 }
 
 // drawings saved in flash while there was no card: move them onto the card, oldest first
-static void moveFlashToSD() {
-  if (!flashReady) return;
+static bool moveFlashToSD() {
+  if (!flashReady) return false;
   std::vector<int> fromFlash, onCard;
   listIds(LittleFS, fromFlash);
-  if (fromFlash.empty()) return;
+  if (fromFlash.empty()) return false;
   listIds(SD, onCard);
   int next = onCard.empty() ? 1 : onCard[0] + 1;
   for (int i = (int)fromFlash.size() - 1; i >= 0; i--) {
@@ -1133,17 +1174,23 @@ static void moveFlashToSD() {
     }
   }
   Serial.printf("Moved %u drawings to the SD card\n", (unsigned)fromFlash.size());
+  return true;
 }
 
 // pick the card if there is one (it can be put in or taken out any time), else flash
 static void chooseStore() {
   if (sdReady && !SD.exists(SAVE_DIR)) { SD.end(); sdReady = false; }  // card taken out
   if (!sdReady && (store != &LittleFS || millis() - lastSdTry > 3000)) sdReady = mountSD();
-  if (sdReady) { store = &SD; maxSaves = SD_MAX_SAVES; moveFlashToSD(); }
+  bool moved = false;
+  if (sdReady) { store = &SD; maxSaves = SD_MAX_SAVES; moved = moveFlashToSD(); }
   else if (flashReady) { store = &LittleFS; maxSaves = FLASH_MAX_SAVES; }
   else store = nullptr;
-  if (store) listIds(*store, saveIds);
-  else saveIds.clear();
+  // re-read the folder only when the store changed (it can hold up to 1000 files)
+  if (store != listedStore || moved) {
+    if (store) listIds(*store, saveIds);
+    else saveIds.clear();
+    listedStore = store;
+  }
 }
 
 static void initDrawStorage() {
@@ -1265,7 +1312,8 @@ static bool saveDrawing(const uint8_t *src) {
   if (!store) return false;
   int id = saveIds.empty() ? 1 : saveIds[0] + 1;
   bool ok = writeDrawing(*store, savePath(id), src);
-  if (!ok && !saveIds.empty() && (int)saveIds.size() >= maxSaves) {  // full: make room, try again
+  for (int tries = 0; !ok && tries < 3 && !saveIds.empty(); tries++) {  // full: make room, try again
+    store->remove(savePath(id));
     store->remove(savePath(saveIds.back()));
     saveIds.pop_back();
     ok = writeDrawing(*store, savePath(id), src);
@@ -1476,13 +1524,23 @@ static void renderGalleryPage() {
   gfx->fillRect(0, 0, SCREEN_W, BAR, C_BAR);
   drawBackButton();
   if (pages > 1) {
-    drawPageArrow(PREV_BX, -1, galleryPage > 0);
-    drawPageArrow(NEXT_BX, +1, galleryPage < pages - 1);
-    int spacing = min(28, 440 / pages);
-    int x0 = 370 - (pages - 1) * spacing / 2;
-    for (int p = 0; p < pages; p++)
-      gfx->fillCircle(x0 + p * spacing, BAR / 2, p == galleryPage ? 9 : 5,
-                     p == galleryPage ? TFT_WHITE : C_BG);
+    // the arrows wrap around (next on the last page goes to the first), so both always work
+    drawPageArrow(PREV_BX, -1, true);
+    drawPageArrow(NEXT_BX, +1, true);
+    if (pages <= 12) {  // a dot per page
+      int spacing = 28;
+      int x0 = 370 - (pages - 1) * spacing / 2;
+      for (int p = 0; p < pages; p++)
+        gfx->fillCircle(x0 + p * spacing, BAR / 2, p == galleryPage ? 9 : 5,
+                       p == galleryPage ? TFT_WHITE : C_BG);
+    } else {            // too many for dots: "3 / 40"
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%d / %d", galleryPage + 1, pages);
+      gfx->setFont(&fonts::FreeSansBold12pt7b);
+      gfx->setTextDatum(textdatum_t::middle_center);
+      gfx->setTextColor(TFT_WHITE);
+      gfx->drawString(buf, 370, BAR / 2 + 1);
+    }
   }
   gfx->endWrite();
   if (saveIds.empty()) {  // nothing saved yet: a big empty picture frame
@@ -1548,14 +1606,16 @@ static void galleryTick(bool pressed, int32_t tx, int32_t ty) {
   if (ty < BAR && tx < 90) { playSound(SND_TAP); resumeDraw(true); return; }
   int pages = galleryPages();
   if (pages > 1 && barButtonPressed(pressed, tx, ty, PREV_BX)) {
-    if (galleryPage > 0) { galleryPage--; playSound(SND_FLIP); drawGalleryPage(); }
-    else playSound(SND_NOPE);
+    galleryPage = (galleryPage + pages - 1) % pages;  // wraps to the last page
+    playSound(SND_FLIP);
+    drawGalleryPage();
     ignoreUntilRelease = true;
     return;
   }
   if (pages > 1 && barButtonPressed(pressed, tx, ty, NEXT_BX)) {
-    if (galleryPage < pages - 1) { galleryPage++; playSound(SND_FLIP); drawGalleryPage(); }
-    else playSound(SND_NOPE);
+    galleryPage = (galleryPage + 1) % pages;  // wraps to the first page
+    playSound(SND_FLIP);
+    drawGalleryPage();
     ignoreUntilRelease = true;
     return;
   }
@@ -1693,8 +1753,13 @@ static void bubblesTick(bool touching, bool pressed, int32_t tx, int32_t ty) {
 }
 
 // ---------------------------------------------------------------- memory app
-static int memSym[8];
-static uint8_t memState[8];  // 0 face down, 1 face up, 2 matched
+// Difficulty L / M / H: L switches between 2 and 3 pairs, M between 3 and 4,
+// H between 5 and 6. Easier levels also leave a wrong pair face up longer.
+static const uint8_t MEM_PAIRS[3][2] = {{2, 3}, {3, 4}, {5, 6}};
+static const uint16_t MEM_SHOW_MS[3] = {1500, 1100, 1000};
+static int memDiff = 1;  // 0 L, 1 M, 2 H (remembered)
+static int memSym[12];
+static uint8_t memState[12];  // 0 face down, 1 face up, 2 matched
 static int memN, memCols, memFirst, memSecond, memRound = 0;
 static uint32_t memFlipBack = 0;
 static int cardW, cardH;
@@ -1723,7 +1788,7 @@ static void drawCard(int i) {
 }
 
 static void startMemory() {
-  int pairs = (memRound % 2 == 0) ? 3 : 4;
+  int pairs = MEM_PAIRS[memDiff][memRound % 2];
   memN = pairs * 2;
   memCols = pairs;
   cardW = (SCREEN_W - 40 - (memCols - 1) * 20) / memCols;
@@ -1738,12 +1803,24 @@ static void startMemory() {
   tft.startWrite();
   tft.fillScreen(C_BG);
   drawPlainBar();
+  drawDiffButtons(memDiff);
   tft.endWrite();
   for (int i = 0; i < memN; i++) drawCard(i);
 }
 
 static void memoryTick(bool touching, bool pressed, int32_t tx, int32_t ty) {
   if (homePressed(pressed, tx, ty)) { playSound(SND_TAP); enterApp(APP_HOME); return; }
+  int dl = diffPressed(pressed, tx, ty);
+  if (dl >= 0) {
+    playSound(SND_TAP);
+    if (dl != memDiff) {  // new difficulty: deal a new game
+      memDiff = dl;
+      prefs.putUChar("memDiff", dl);
+      memRound = 0;
+      startMemory();
+    }
+    return;
+  }
   if (memFlipBack && millis() >= memFlipBack) {  // not a match: turn both back over
     memState[memFirst] = memState[memSecond] = 0;
     playSound(SND_NOPE);
@@ -1783,7 +1860,7 @@ static void memoryTick(bool touching, bool pressed, int32_t tx, int32_t ty) {
         waitForRelease();
       }
     } else {
-      memFlipBack = millis() + 1100;
+      memFlipBack = millis() + MEM_SHOW_MS[memDiff];
     }
     return;
   }
@@ -1808,6 +1885,10 @@ void setup() {
   initSound();      // also opens the saved settings
   initBacklight();  // turns the screen on at the saved brightness
   initDrawStorage();
+  mazeDiff = constrain(prefs.getUChar("mazeDiff", 0), 0, 2);  // saved difficulty levels
+  level = BAND_FIRST[mazeDiff];
+  memDiff = constrain(prefs.getUChar("memDiff", 1), 0, 2);
+  Serial.printf("Difficulty: maze %c, memory %c\n", "LMH"[mazeDiff], "LMH"[memDiff]);
   Serial.printf("Display up (brightness %c)\n", "LMH"[brightLevel]);
 
   drawHome();
